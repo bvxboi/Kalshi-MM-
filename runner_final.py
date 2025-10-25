@@ -33,7 +33,9 @@ def create_market_maker(mm_config, api, logger):
         min_spread=mm_config.get('min_spread', 0.01),
         position_limit_buffer=mm_config.get('position_limit_buffer', 0.1),
         inventory_skew_factor=mm_config.get('inventory_skew_factor', 0.01),
-        trade_side=mm_config.get('trade_side', 'yes')
+        trade_side=mm_config.get('trade_side', 'yes'),
+        expiry_time=mm_config.get('expiry_time'),
+        dynamic_timing=mm_config.get('dynamic_timing')
     )
 
 def run_strategy(config_name: str, config: Dict):

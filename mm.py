@@ -1,6 +1,7 @@
 import abc
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from datetime import datetime, timezone
 import requests
 import logging
 import uuid
@@ -224,7 +225,9 @@ class AvellanedaMarketMaker:
         min_spread: float = 0.01,
         position_limit_buffer: float = 0.1,
         inventory_skew_factor: float = 0.01,
-        trade_side: str = "yes"
+        trade_side: str = "yes",
+        expiry_time: Optional[str] = None,
+        dynamic_timing: Optional[Dict] = None
     ):
         self.api = api
         self.logger = logger
@@ -239,67 +242,174 @@ class AvellanedaMarketMaker:
         self.inventory_skew_factor = inventory_skew_factor
         self.trade_side = trade_side
 
+        # Dynamic timing configuration
+        self.expiry_time = self._parse_expiry_time(expiry_time) if expiry_time else None
+        self.dynamic_timing = dynamic_timing or {"enabled": False, "phases": {}}
+        self.use_dynamic_timing = self.dynamic_timing.get("enabled", False) and self.expiry_time is not None
+
+        if self.use_dynamic_timing:
+            self.logger.info(f"Dynamic timing enabled. Market expiry: {expiry_time}")
+        else:
+            self.logger.info(f"Using fixed time horizon: {T} seconds")
+
+    def _parse_expiry_time(self, expiry_time_str: str) -> datetime:
+        """Parse expiry time string to datetime object (UTC)"""
+        try:
+            return datetime.strptime(expiry_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError as e:
+            self.logger.error(f"Invalid expiry_time format: {expiry_time_str}. Expected 'YYYY-MM-DD HH:MM:SS'. Error: {e}")
+            raise
+
+    def _get_time_to_expiration(self) -> float:
+        """Calculate time remaining until expiration in seconds"""
+        if self.expiry_time is None:
+            return float('inf')
+        now = datetime.now(timezone.utc)
+        time_remaining = (self.expiry_time - now).total_seconds()
+        return max(0, time_remaining)
+
+    def _get_current_phase(self) -> Tuple[str, Dict]:
+        """
+        Determine the current trading phase based on time to expiration.
+        Returns (phase_name, phase_config)
+        """
+        if not self.use_dynamic_timing:
+            # Return default phase
+            return "default", {
+                "gamma_multiplier": 1.0,
+                "spread_multiplier": 1.0,
+                "order_size_multiplier": 1.0,
+                "dt_override": None,
+                "inventory_target_ratio": None
+            }
+
+        time_to_expiry_minutes = self._get_time_to_expiration() / 60
+        phases = self.dynamic_timing.get("phases", {})
+
+        # Sort phases by min_time_to_expiry in descending order
+        sorted_phases = sorted(
+            phases.items(),
+            key=lambda x: x[1].get("min_time_to_expiry", 0),
+            reverse=True
+        )
+
+        # Find the appropriate phase
+        for phase_name, phase_config in sorted_phases:
+            if time_to_expiry_minutes >= phase_config.get("min_time_to_expiry", 0):
+                return phase_name, phase_config
+
+        # Default to the last phase if no match (shouldn't happen)
+        if sorted_phases:
+            return sorted_phases[-1]
+
+        # Fallback
+        return "default", {
+            "gamma_multiplier": 1.0,
+            "spread_multiplier": 1.0,
+            "order_size_multiplier": 1.0,
+            "dt_override": None,
+            "inventory_target_ratio": None
+        }
+
+    def _should_continue_trading(self) -> bool:
+        """Check if trading should continue based on time"""
+        if self.use_dynamic_timing:
+            return self._get_time_to_expiration() > 0
+        else:
+            # Use original time-based check
+            return True
+
     def run(self, dt: float):
         start_time = time.time()
-        while time.time() - start_time < self.T:
-            current_time = time.time() - start_time
-            self.logger.info(f"Running Avellaneda market maker at {current_time:.2f}")
+
+        while self._should_continue_trading():
+            # Calculate time metrics
+            if self.use_dynamic_timing:
+                time_to_expiry = self._get_time_to_expiration()
+                if time_to_expiry <= 0:
+                    self.logger.info("Market has expired. Stopping trading.")
+                    break
+                current_time = self.T - time_to_expiry  # For backwards compatibility with formulas
+            else:
+                current_time = time.time() - start_time
+                if current_time >= self.T:
+                    break
+
+            # Get current phase and configuration
+            phase_name, phase_config = self._get_current_phase()
+
+            # Log timing and phase information
+            if self.use_dynamic_timing:
+                time_to_expiry_min = time_to_expiry / 60
+                self.logger.info(f"Running Avellaneda market maker | Phase: {phase_name} | Time to expiry: {time_to_expiry_min:.2f} min")
+            else:
+                self.logger.info(f"Running Avellaneda market maker at {current_time:.2f}s")
 
             mid_prices = self.api.get_price()
             mid_price = mid_prices[self.trade_side]
             inventory = self.api.get_position()
             self.logger.info(f"Current mid price for {self.trade_side}: {mid_price:.4f}, Inventory: {inventory}")
 
-            reservation_price = self.calculate_reservation_price(mid_price, inventory, current_time)
-            bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time)
-            buy_size, sell_size = self.calculate_order_sizes(inventory)
+            reservation_price = self.calculate_reservation_price(mid_price, inventory, current_time, phase_config)
+            bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time, phase_config)
+            buy_size, sell_size = self.calculate_order_sizes(inventory, phase_config)
 
             self.logger.info(f"Reservation price: {reservation_price:.4f}")
             self.logger.info(f"Computed desired bid: {bid_price:.4f}, ask: {ask_price:.4f}")
+            self.logger.info(f"Computed order sizes - Buy: {buy_size}, Sell: {sell_size}")
 
             self.manage_orders(bid_price, ask_price, buy_size, sell_size)
 
-            time.sleep(dt)
+            # Use phase-specific dt if available
+            sleep_time = phase_config.get("dt_override") or dt
+            time.sleep(sleep_time)
 
         self.logger.info("Avellaneda market maker finished running")
 
-    def calculate_asymmetric_quotes(self, mid_price: float, inventory: int, t: float) -> Tuple[float, float]:
-        reservation_price = self.calculate_reservation_price(mid_price, inventory, t)
-        base_spread = self.calculate_optimal_spread(t, inventory)
-        
+    def calculate_asymmetric_quotes(self, mid_price: float, inventory: int, t: float, phase_config: Dict) -> Tuple[float, float]:
+        reservation_price = self.calculate_reservation_price(mid_price, inventory, t, phase_config)
+        base_spread = self.calculate_optimal_spread(t, inventory, phase_config)
+
         position_ratio = inventory / self.max_position
         spread_adjustment = base_spread * abs(position_ratio) * 3
-        
+
         if inventory > 0:
             bid_spread = base_spread / 2 + spread_adjustment
             ask_spread = max(base_spread / 2 - spread_adjustment, self.min_spread / 2)
         else:
             bid_spread = max(base_spread / 2 - spread_adjustment, self.min_spread / 2)
             ask_spread = base_spread / 2 + spread_adjustment
-        
+
         bid_price = max(0, min(mid_price, reservation_price - bid_spread))
         ask_price = min(1, max(mid_price, reservation_price + ask_spread))
-        
+
         return bid_price, ask_price
 
-    def calculate_reservation_price(self, mid_price: float, inventory: int, t: float) -> float:
-        dynamic_gamma = self.calculate_dynamic_gamma(inventory)
+    def calculate_reservation_price(self, mid_price: float, inventory: int, t: float, phase_config: Dict) -> float:
+        dynamic_gamma = self.calculate_dynamic_gamma(inventory, phase_config)
         inventory_skew = inventory * self.inventory_skew_factor * mid_price
         return mid_price + inventory_skew - inventory * dynamic_gamma * (self.sigma**2) * (1 - t/self.T)
 
-    def calculate_optimal_spread(self, t: float, inventory: int) -> float:
-        dynamic_gamma = self.calculate_dynamic_gamma(inventory)
-        base_spread = (dynamic_gamma * (self.sigma**2) * (1 - t/self.T) + 
+    def calculate_optimal_spread(self, t: float, inventory: int, phase_config: Dict) -> float:
+        dynamic_gamma = self.calculate_dynamic_gamma(inventory, phase_config)
+        base_spread = (dynamic_gamma * (self.sigma**2) * (1 - t/self.T) +
                        (2 / dynamic_gamma) * math.log(1 + (dynamic_gamma / self.k)))
         position_ratio = abs(inventory) / self.max_position
         spread_adjustment = 1 - (position_ratio ** 2)
-        return max(base_spread * spread_adjustment * 0.01, self.min_spread)
 
-    def calculate_dynamic_gamma(self, inventory: int) -> float:
+        # Apply spread multiplier from phase config
+        spread_multiplier = phase_config.get("spread_multiplier", 1.0)
+        return max(base_spread * spread_adjustment * 0.01 * spread_multiplier, self.min_spread)
+
+    def calculate_dynamic_gamma(self, inventory: int, phase_config: Dict) -> float:
         position_ratio = inventory / self.max_position
-        return self.base_gamma * math.exp(-abs(position_ratio))
+        base_value = self.base_gamma * math.exp(-abs(position_ratio))
 
-    def calculate_order_sizes(self, inventory: int) -> Tuple[int, int]:
+        # Apply gamma multiplier from phase config
+        gamma_multiplier = phase_config.get("gamma_multiplier", 1.0)
+        return base_value * gamma_multiplier
+
+    def calculate_order_sizes(self, inventory: int, phase_config: Dict) -> Tuple[int, int]:
         # Calculate maximum possible buy/sell before hitting position limits
         # max_position defines the range: [-max_position, +max_position]
         max_buy = self.max_position - inventory  # How much we can buy before hitting +max_position
@@ -307,20 +417,44 @@ class AvellanedaMarketMaker:
 
         buffer_size = int(self.max_position * self.position_limit_buffer)
 
-        if inventory > 0:  # Long position - limit buying, allow selling
-            # Restrict buy size using buffer to prevent excessive accumulation
-            buy_size = max(0, min(buffer_size, max_buy))
-            # Allow selling up to max_position or remaining capacity to negative side
-            sell_size = max(0, min(self.max_position, max_sell))
-        elif inventory < 0:  # Short position - allow buying, limit selling
-            # Allow buying up to max_position or remaining capacity to positive side
-            buy_size = max(0, min(self.max_position, max_buy))
-            # Restrict sell size using buffer to prevent excessive accumulation
-            sell_size = max(0, min(buffer_size, max_sell))
-        else:  # Neutral position
-            # Both sides limited by max_position
-            buy_size = min(self.max_position, max_buy)
-            sell_size = min(self.max_position, max_sell)
+        # Check if we have an inventory target ratio (for unwinding positions)
+        inventory_target_ratio = phase_config.get("inventory_target_ratio")
+        if inventory_target_ratio is not None:
+            target_inventory = int(inventory * inventory_target_ratio)
+            inventory_delta = inventory - target_inventory
+
+            if inventory_delta > 0:  # Need to sell to reduce long position
+                # Prioritize selling, minimize buying
+                sell_size = max(0, min(abs(inventory_delta), max_sell))
+                buy_size = 0  # Don't buy when unwinding long
+            elif inventory_delta < 0:  # Need to buy to reduce short position
+                # Prioritize buying, minimize selling
+                buy_size = max(0, min(abs(inventory_delta), max_buy))
+                sell_size = 0  # Don't sell when unwinding short
+            else:  # At target
+                buy_size = 0
+                sell_size = 0
+        else:
+            # Standard order sizing logic
+            if inventory > 0:  # Long position - limit buying, allow selling
+                # Restrict buy size using buffer to prevent excessive accumulation
+                buy_size = max(0, min(buffer_size, max_buy))
+                # Allow selling up to max_position or remaining capacity to negative side
+                sell_size = max(0, min(self.max_position, max_sell))
+            elif inventory < 0:  # Short position - allow buying, limit selling
+                # Allow buying up to max_position or remaining capacity to positive side
+                buy_size = max(0, min(self.max_position, max_buy))
+                # Restrict sell size using buffer to prevent excessive accumulation
+                sell_size = max(0, min(buffer_size, max_sell))
+            else:  # Neutral position
+                # Both sides limited by max_position
+                buy_size = min(self.max_position, max_buy)
+                sell_size = min(self.max_position, max_sell)
+
+        # Apply order size multiplier from phase config
+        order_size_multiplier = phase_config.get("order_size_multiplier", 1.0)
+        buy_size = max(0, int(buy_size * order_size_multiplier))
+        sell_size = max(0, int(sell_size * order_size_multiplier))
 
         return buy_size, sell_size
 
