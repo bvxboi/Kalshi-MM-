@@ -300,16 +300,28 @@ class AvellanedaMarketMaker:
         return self.base_gamma * math.exp(-abs(position_ratio))
 
     def calculate_order_sizes(self, inventory: int) -> Tuple[int, int]:
-        remaining_capacity = self.max_position - abs(inventory)
+        # Calculate maximum possible buy/sell before hitting position limits
+        # max_position defines the range: [-max_position, +max_position]
+        max_buy = self.max_position - inventory  # How much we can buy before hitting +max_position
+        max_sell = inventory + self.max_position  # How much we can sell before hitting -max_position
+
         buffer_size = int(self.max_position * self.position_limit_buffer)
-        
-        if inventory > 0:
-            buy_size = max(1, min(buffer_size, remaining_capacity))
-            sell_size = max(1, self.max_position)
-        else:
-            buy_size = max(1, self.max_position)
-            sell_size = max(1, min(buffer_size, remaining_capacity))
-        
+
+        if inventory > 0:  # Long position - limit buying, allow selling
+            # Restrict buy size using buffer to prevent excessive accumulation
+            buy_size = max(0, min(buffer_size, max_buy))
+            # Allow selling up to max_position or remaining capacity to negative side
+            sell_size = max(0, min(self.max_position, max_sell))
+        elif inventory < 0:  # Short position - allow buying, limit selling
+            # Allow buying up to max_position or remaining capacity to positive side
+            buy_size = max(0, min(self.max_position, max_buy))
+            # Restrict sell size using buffer to prevent excessive accumulation
+            sell_size = max(0, min(buffer_size, max_sell))
+        else:  # Neutral position
+            # Both sides limited by max_position
+            buy_size = min(self.max_position, max_buy)
+            sell_size = min(self.max_position, max_sell)
+
         return buy_size, sell_size
 
     def manage_orders(self, bid_price: float, ask_price: float, buy_size: int, sell_size: int):
@@ -333,6 +345,14 @@ class AvellanedaMarketMaker:
         self.handle_order_side('sell', sell_orders, ask_price, sell_size)
 
     def handle_order_side(self, action: str, orders: List[Dict], desired_price: float, desired_size: int):
+        # If desired size is 0, cancel all orders and don't place new ones
+        if desired_size == 0:
+            self.logger.info(f"Desired {action} size is 0 (at position limit). Cancelling all {action} orders.")
+            for order in orders:
+                self.logger.info(f"Cancelling {action} order. ID: {order['order_id']}")
+                self.api.cancel_order(order['order_id'])
+            return
+
         keep_order = None
         for order in orders:
             current_price = float(order['yes_price']) / 100 if self.trade_side == 'yes' else float(order['no_price']) / 100
