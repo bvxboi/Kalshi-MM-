@@ -5,7 +5,6 @@ import yaml
 from dotenv import load_dotenv
 import os
 from typing import Dict
-
 from mm import KalshiTradingAPI, AvellanedaMarketMaker
 
 def load_config(config_file):
@@ -14,8 +13,8 @@ def load_config(config_file):
 
 def create_api(api_config, logger):
     return KalshiTradingAPI(
-        email=os.getenv("KALSHI_EMAIL"),
-        password=os.getenv("KALSHI_PASSWORD"),
+        api_key_id=os.getenv("KALSHI_API_KEY_ID"),
+        private_key_path=os.getenv("KALSHI_PRIVATE_KEY_PATH"),
         market_ticker=api_config['market_ticker'],
         base_url=os.getenv("KALSHI_BASE_URL"),
         logger=logger,
@@ -38,63 +37,56 @@ def create_market_maker(mm_config, api, logger):
     )
 
 def run_strategy(config_name: str, config: Dict):
-    # Create a logger for this specific strategy
     logger = logging.getLogger(f"Strategy_{config_name}")
     logger.setLevel(config.get('log_level', 'INFO'))
-
-    # Create file handler
+    
     fh = logging.FileHandler(f"{config_name}.log")
     fh.setLevel(config.get('log_level', 'INFO'))
     
-    # Create console handler
     ch = logging.StreamHandler()
     ch.setLevel(config.get('log_level', 'INFO'))
     
-    # Create formatter
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     fh.setFormatter(formatter)
     ch.setFormatter(formatter)
     
-    # Add handlers to logger
     logger.addHandler(fh)
     logger.addHandler(ch)
-
+    
     logger.info(f"Starting strategy: {config_name}")
-
-    # Create API
+    
     api = create_api(config['api'], logger)
-
-    # Create market maker
     market_maker = create_market_maker(config['market_maker'], api, logger)
-
+    
     try:
-        # Run market maker
         market_maker.run(config.get('dt', 1.0))
     except KeyboardInterrupt:
         logger.info("Market maker stopped by user")
     except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
+        logger.error(f"An error occurred: {str(e)}", exc_info=True)
     finally:
-        # Ensure logout happens even if an exception occurs
         api.logout()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kalshi Market Making Algorithm")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
     args = parser.parse_args()
-
-    # Load all configurations
+    
     configs = load_config(args.config)
-
-    # Load environment variables
     load_dotenv()
-
-    # Print the name of every strategy being run
+    
     print("Starting the following strategies:")
     for config_name in configs:
         print(f"- {config_name}")
-
-    # Run all strategies in parallel using ThreadPoolExecutor
+    
     with ThreadPoolExecutor(max_workers=len(configs)) as executor:
+        futures = []
         for config_name, config in configs.items():
-            executor.submit(run_strategy, config_name, config)
+            future = executor.submit(run_strategy, config_name, config)
+            futures.append(future)
+        
+        for future in futures:
+            try:
+                future.result()
+            except Exception as e:
+                print(f"Strategy failed with error: {e}")

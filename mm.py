@@ -5,6 +5,10 @@ import requests
 import logging
 import uuid
 import math
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
+import base64
 
 class AbstractTradingAPI(abc.ABC):
     @abc.abstractmethod
@@ -30,52 +34,73 @@ class AbstractTradingAPI(abc.ABC):
 class KalshiTradingAPI(AbstractTradingAPI):
     def __init__(
         self,
-        email: str,
-        password: str,
+        api_key_id: str,
+        private_key_path: str,
         market_ticker: str,
         base_url: str,
         logger: logging.Logger,
     ):
-        self.email = email
-        self.password = password
+        self.api_key_id = api_key_id
+        self.private_key_path = private_key_path
         self.market_ticker = market_ticker
-        self.token = None
-        self.member_id = None
         self.logger = logger
         self.base_url = base_url
-        self.login()
+        self.private_key = self.load_private_key()
+        self.logger.info("Initialized with API key authentication")
 
-    def login(self):
-        url = f"{self.base_url}/login"
-        data = {"email": self.email, "password": self.password}
-        response = requests.post(url, json=data)
-        response.raise_for_status()
-        result = response.json()
-        self.token = result["token"]
-        self.member_id = result.get("member_id")
-        self.logger.info("Successfully logged in")
+    def load_private_key(self):
+        """Load the private key from file"""
+        try:
+            with open(self.private_key_path, "rb") as key_file:
+                private_key = serialization.load_pem_private_key(
+                    key_file.read(),
+                    password=None,
+                    backend=default_backend()
+                )
+            self.logger.info("Successfully loaded private key")
+            return private_key
+        except Exception as e:
+            self.logger.error(f"Failed to load private key: {e}")
+            raise
+
+    def sign_request(self, timestamp: str, method: str, path: str) -> str:
+        """Sign the request using the private key"""
+        msg_string = timestamp + method + path
+        signature = self.private_key.sign(
+            msg_string.encode('utf-8'),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH  # Changed from MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return base64.b64encode(signature).decode('utf-8')
+
+    def get_headers(self, method: str, path: str, params: Dict = None):
+        """Generate headers with signature for API request"""
+        timestamp = str(int(time.time() * 1000))
+        
+        # Build the full path with query parameters for signature
+        signature = self.sign_request(timestamp, method, path)
+        
+        return {
+             "KALSHI-ACCESS-KEY": self.api_key_id,
+        "KALSHI-ACCESS-SIGNATURE": signature,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        "Content-Type": "application/json",
+    }
 
     def logout(self):
-        if self.token:
-            url = f"{self.base_url}/logout"
-            headers = self.get_headers()
-            response = requests.post(url, headers=headers)
-            response.raise_for_status()
-            self.token = None
-            self.member_id = None
-            self.logger.info("Successfully logged out")
-
-    def get_headers(self):
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
+        """Logout is not needed with API key authentication"""
+        self.logger.info("Logout not required with API key authentication")
 
     def make_request(
         self, method: str, path: str, params: Dict = None, data: Dict = None
     ):
         url = f"{self.base_url}{path}"
-        headers = self.get_headers()
+        full_path = f"/trade-api/v2{path}"
+        headers = self.get_headers(method, full_path, params)
+
 
         try:
             response = requests.request(
@@ -132,13 +157,13 @@ class KalshiTradingAPI(AbstractTradingAPI):
         path = "/portfolio/orders"
         data = {
             "ticker": self.market_ticker,
-            "action": action.lower(),  # 'buy' or 'sell'
+            "action": action.lower(),
             "type": "limit",
-            "side": side,  # 'yes' or 'no'
+            "side": side,
             "count": quantity,
             "client_order_id": str(uuid.uuid4()),
         }
-        price_to_send = int(price * 100) # Convert dollars to cents
+        price_to_send = int(price * 100)
 
         if side == "yes":
             data["yes_price"] = price_to_send
@@ -163,11 +188,18 @@ class KalshiTradingAPI(AbstractTradingAPI):
     def cancel_order(self, order_id: int) -> bool:
         self.logger.info(f"Canceling order with ID {order_id}...")
         path = f"/portfolio/orders/{order_id}"
-        response = self.make_request("DELETE", path)
-        success = response["reduced_by"] > 0
-        self.logger.info(f"Canceled order with ID {order_id}, success: {success}")
-        return success
-
+        try:
+            response = self.make_request("DELETE", path)
+            success = response["reduced_by"] > 0
+            self.logger.info(f"Canceled order with ID {order_id}, success: {success}")
+            return success
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                self.logger.info(f"Order {order_id} already filled or cancelled")
+                return False
+            else:
+                raise
+    
     def get_orders(self) -> List[Dict]:
         self.logger.info("Retrieving orders...")
         path = "/portfolio/orders"
@@ -176,6 +208,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
         orders = response.get("orders", [])
         self.logger.info(f"Retrieved {len(orders)} orders")
         return orders
+    
 
 class AvellanedaMarketMaker:
     def __init__(
@@ -296,10 +329,7 @@ class AvellanedaMarketMaker:
         self.logger.info(f"Current buy orders: {len(buy_orders)}")
         self.logger.info(f"Current sell orders: {len(sell_orders)}")
 
-        # Handle buy orders
         self.handle_order_side('buy', buy_orders, bid_price, buy_size)
-
-        # Handle sell orders
         self.handle_order_side('sell', sell_orders, ask_price, sell_size)
 
     def handle_order_side(self, action: str, orders: List[Dict], desired_price: float, desired_size: int):

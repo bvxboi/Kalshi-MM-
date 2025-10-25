@@ -1,47 +1,15 @@
-RATECUTCOUNT-24DEC31-T4:
+ETH-3740:
   api:
-    market_ticker: RATECUTCOUNT-24DEC31-T4
-    trade_side: "yes"
+    market_ticker: KXBTCD-25OCT2117-T110999.99
   market_maker:
-    max_position: 5
-    order_expiration: 28800 # 8 hours
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
-
-FEDDECISION-24NOV-C25:
-  api:
-    market_ticker: FEDDECISION-24NOV-C25
     trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 28800 # 8 hours
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
-
-FEDDECISION-24NOV-H0:
-  api:
-    market_ticker: FEDDECISION-24NOV-H0
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 28800 # 8 hours
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
+    max_position: 10
+    order_expiration: 1800
+    gamma: 0.4
+    k: 2.0
+    sigma: 0.04
+    T: 3600
+    min_spread: 0.01
+    position_limit_buffer: 0.2
+    inventory_skew_factor: 0.005
   dt: 2.0
